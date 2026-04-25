@@ -1,0 +1,188 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: scanning-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: scanning-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: scanning-redisinsight
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      RI_ACCEPT_TERMS_AND_CONDITIONS: "true"
+      RI_REDIS_HOST: redis
+      RI_REDIS_PORT: "6379"
+      RI_REDIS_ALIAS: scanning-redis
+      RI_REDIS_DB: "0"
+    ports:
+      - "5540:5540"
+    volumes:
+      - redisinsight_data:/data
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: scanning-pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+      PGADMIN_SERVER_JSON_FILE: /pgadmin4/servers.json
+      PGADMIN_REPLACE_SERVERS_ON_STARTUP: "True"
+      PGPASS_FILE: /tmp/pgpass
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - cp /pgpass_ro /tmp/pgpass && chmod 600 /tmp/pgpass && exec /entrypoint.sh
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./devtools/pgadmin/servers.json:/pgadmin4/servers.json:ro
+      - ./devtools/pgadmin/pgpass:/pgpass_ro:ro
+
+  airflow-init:
+    image: apache/airflow:2.10.3
+    container_name: scanning-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW_UID: "50000"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --role Admin --username admin --password admin --firstname Admin --lastname User --email admin@example.com || true"
+
+  airflow-webserver:
+    image: apache/airflow:2.10.3
+    container_name: scanning-airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW_UID: "50000"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    command: webserver
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.3
+    container_name: scanning-airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW_UID: "50000"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    command: scheduler
+
+  scheduler-worker:
+    build:
+      context: ./scheduler-worker
+      dockerfile: Dockerfile
+    container_name: scanning-scheduler-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgres://scanning:scanning@postgres:5432/scanning?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_STREAM_NORMAL: scan_jobs:normal
+      REDIS_STREAM_URGENT: scan_jobs:urgent
+      PRIORITY_URGENT_THRESHOLD: "50"
+      SCHEDULER_CLAIM_BATCH_SIZE: "100"
+      SCHEDULER_MAX_QUEUE_DEPTH: "5000"
+      SCAN_MAX_ATTEMPTS: "3"
+
+  airflow-worker:
+    build:
+      context: ./airflow-worker
+      dockerfile: Dockerfile
+    container_name: scanning-airflow-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgres://scanning:scanning@postgres:5432/scanning?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_STREAM_NORMAL: scan_jobs:normal
+      REDIS_STREAM_URGENT: scan_jobs:urgent
+      REDIS_CONSUMER_GROUP: scan-workers
+      WORKERS_PER_CONTROLLER: "4"
+      REDIS_URGENT_BURST: "20"
+      AIRFLOW_BASE_URL: http://airflow-webserver:8080
+      AIRFLOW_DAG_ID: scan_example
+      AIRFLOW_TASK_ID: run_scan
+      AIRFLOW_USERNAME: admin
+      AIRFLOW_PASSWORD: admin
+
+volumes:
+  postgres_data:
+  redis_data:
+  redisinsight_data:
+  pgadmin_data:

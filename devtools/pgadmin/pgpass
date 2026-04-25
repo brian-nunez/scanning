@@ -1,0 +1,3 @@
+postgres:5432:scanning:scanning:scanning
+postgres:5432:airflow:airflow:airflow
+postgres:5432:postgres:postgres:postgres

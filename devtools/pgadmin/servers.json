@@ -1,0 +1,30 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "scanning-db",
+      "Group": "Local Docker",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "scanning",
+      "Username": "scanning",
+      "ConnectionParameters": {
+        "sslmode": "prefer",
+        "connect_timeout": 10,
+        "passfile": "/tmp/pgpass"
+      }
+    },
+    "2": {
+      "Name": "airflow-db",
+      "Group": "Local Docker",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "airflow",
+      "Username": "airflow",
+      "ConnectionParameters": {
+        "sslmode": "prefer",
+        "connect_timeout": 10,
+        "passfile": "/tmp/pgpass"
+      }
+    }
+  }
+}
