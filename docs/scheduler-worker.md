@@ -13,8 +13,7 @@ It continuously polls Postgres for recurring scans that are due to run, claims t
 4. [Startup & Shutdown Lifecycle](#4-startup--shutdown-lifecycle)
 5. [Main Processing Flow](#5-main-processing-flow)
 6. [Spread Scheduling](#6-spread-scheduling)
-7. [Deduplication Guard](#7-deduplication-guard)
-8. [Claim Recovery](#8-claim-recovery)
+7. [Deduplication Guard](#7-deduplication-guard)8. [Claim Recovery](#8-claim-recovery)
 9. [Redis Message Payload](#9-redis-message-payload)
 10. [Error Scenarios](#10-error-scenarios)
 
@@ -28,7 +27,7 @@ It continuously polls Postgres for recurring scans that are due to run, claims t
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │  Poll ticker (default 5 s)                               │  │
-│  │    └─▶ queueDepth check ──▶ claimDueScans ──▶ enqueue   │  │
+│  │    └─▶ queueBacklog check ──▶ claimDueScans ──▶ enqueue │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │  Recovery ticker (default 1 m)                           │  │
@@ -118,12 +117,12 @@ All values are read from environment variables at startup. Defaults are applied 
 | `REDIS_DB` | `0` | Redis logical database index |
 | `REDIS_STREAM_NORMAL` | `scan_jobs:normal` | Normal-priority stream name |
 | `REDIS_STREAM_URGENT` | `scan_jobs:urgent` | Urgent-priority stream name |
+| `REDIS_CONSUMER_GROUP` | `scan-workers` | Consumer group used when calling `ensureConsumerGroup` at startup |
 | `SCHEDULER_POLL_INTERVAL` | `5s` | How often to poll Postgres for due scans |
 | `SCHEDULER_RECOVERY_INTERVAL` | `1m` | How often to recover expired claims |
 | `SCHEDULER_CLAIM_LEASE` | `2m` | TTL for a claim before recovery resets it |
 | `SCHEDULER_CLAIM_BATCH_SIZE` | `100` | Max scans claimed per poll iteration |
-| `SCHEDULER_MAX_QUEUE_DEPTH` | `5000` | Back-pressure threshold: stop enqueuing when combined stream length ≥ this value |
-| `SCHEDULER_REDIS_DEDUPE_TTL` | `24h` | How long the deduplication key lives in Redis |
+| `SCHEDULER_MAX_QUEUE_DEPTH` | `5000` | Back-pressure threshold: stop enqueuing when consumer group backlog ≥ this value |
 | `SCHEDULER_WORKER_ID` | OS hostname | Used as `claim_owner` in Postgres |
 | `SCAN_MAX_ATTEMPTS` | `3` | Written into each `recurring_scan_runs` row as `max_attempts` |
 | `PRIORITY_URGENT_THRESHOLD` | `50` | Minimum priority value to use the urgent stream |
@@ -144,6 +143,8 @@ main()
   ├─ signal.NotifyContext()      listen for SIGINT / SIGTERM
   ├─ goroutine: svc.Start(ctx)
   │     ├─ ping()                10 s timeout ping to Postgres and Redis
+  │     ├─ ensureConsumerGroup(StreamUrgent)   XGROUP CREATE MKSTREAM … 0
+  │     ├─ ensureConsumerGroup(StreamNormal)   XGROUP CREATE MKSTREAM … 0
   │     ├─ start pollTicker      (PollInterval)
   │     ├─ start recoveryTicker  (RecoveryInterval)
   │     └─ event loop (select)
@@ -165,9 +166,13 @@ Each `pollTicker` tick runs `runOnce()`:
 ```
 runOnce()
   │
-  ├─ 1. queueDepth()
-  │       XLen(scan_jobs:urgent) + XLen(scan_jobs:normal)
-  │       If depth >= MaxQueueDepth → log WARN "scheduler backpressure active", skip iteration
+  ├─ 1. queueBacklog()
+  │       For each stream (urgent, normal):
+  │         XINFO GROUPS → find the consumer group (ConsumerGroup)
+  │         backlog = group.Pending + group.Lag   (unprocessed messages for this group)
+  │         If stream doesn't exist or group not found → 0
+  │       Total backlog = urgentBacklog + normalBacklog
+  │       If backlog >= MaxQueueDepth → log WARN "scheduler backpressure active", skip iteration
   │
   └─ 2. claimDueScans()
           SQL: SELECT … FOR UPDATE SKIP LOCKED LIMIT $ClaimBatchSize
@@ -190,16 +195,15 @@ processClaimedScan(scan)
   ├─ 2. ensureRunRow()
   │       INSERT INTO recurring_scan_runs … status='created', redis_job_key=redisJobKey
   │       ON CONFLICT (redis_job_key) DO UPDATE SET updated_at=now()
-  │       RETURNING id
-  │       → runID (existing or newly created)
+  │       RETURNING id::text, status
+  │       → (runID, runStatus) — existing or newly created
   │
-  ├─ 3. Redis SETNX "dedupe:<redisJobKey>" "1" TTL=RedisDedupeTTL
-  │       If key already exists (created=false):
-  │         → log INFO "dedupe key already exists, skipping redis enqueue"
-  │         → advanceSchedule()
-  │         → return nil  ← message will not be enqueued again
+  ├─ 3. NextRunAtForFrequency() → compute next scheduled run time + spread offset
   │
-  ├─ 4. NextRunAtForFrequency() → compute next scheduled run time + spread offset
+  ├─ 4. If runStatus != "created":
+  │       → log INFO "scan run already exists in non-created state, skipping enqueue"
+  │       → advanceSchedule()
+  │       → return nil  ← message will not be enqueued again
   │
   ├─ 5. Select stream:
   │       priority >= PriorityUrgentThreshold → scan_jobs:urgent
@@ -208,7 +212,7 @@ processClaimedScan(scan)
   ├─ 6. Build payload (see §9)
   │
   ├─ 7. redis.XAdd(stream, payload)
-  │       On failure → Del(dedupeKey) to roll back guard, return error
+  │       On failure → return error (scan stays in claiming; recovery resets it)
   │
   ├─ 8. markRunEnqueued()  UPDATE status='enqueued', redis_stream, redis_message_id
   │
@@ -250,21 +254,25 @@ Unsupported frequency values return an error, which causes the scan row to remai
 
 ## 7. Deduplication Guard
 
-The dedupe key has the form:
+Deduplication is handled entirely in Postgres — no Redis key is involved.
 
+`ensureRunRow()` issues an upsert keyed on `redis_job_key`:
+
+```sql
+INSERT INTO recurring_scan_runs (…, status, redis_job_key, …)
+VALUES (…, 'created', $key, …)
+ON CONFLICT (redis_job_key) DO UPDATE SET updated_at = now()
+RETURNING id::text, status;
 ```
-dedupe:scan:<scan_id>:<scheduled_for_unix>
-```
 
-It lives in Redis with a TTL equal to `SCHEDULER_REDIS_DEDUPE_TTL` (default 24 h).
+The `RETURNING status` clause reveals whether the row was **freshly inserted** (`status = 'created'`) or already existed in some other state (e.g. `enqueued`, `running`, `succeeded`).
 
-**Purpose:** prevent the same `(scan, scheduled_for)` pair from being enqueued more than once when multiple scheduler-worker replicas are running simultaneously or when a claim is processed twice due to recovery.
+If `status != 'created'`, `processClaimedScan` skips the Redis `XADD`, calls `advanceSchedule()` to move `next_run_at` forward, and returns. This prevents double-enqueuing the same `(scan, scheduled_for)` pair when:
 
-If the SETNX call indicates the key already exists, the scheduler:
-1. Skips the Redis `XADD`.
-2. Still calls `advanceSchedule()` so the scan's `next_run_at` advances and the scan re-enters the `scheduled` state.
+- Multiple scheduler-worker replicas race on the same claim (both instances win a claim due to a timing edge case).
+- A claim is recovered and re-processed while the original message is still in-flight.
 
-If the `XADD` fails after the dedupe key was set, the dedupe key is deleted (`DEL`) so the next poll can retry.
+**Compared to the old Redis SETNX approach**, this design is simpler (one fewer external system involved), more durable (the check survives Redis restarts), and self-healing (the Postgres row's status reflects actual pipeline progress).
 
 ---
 
@@ -316,17 +324,17 @@ Each message written to a Redis Stream has the following fields:
 
 Same as above — `ping()` checks Redis after Postgres.
 
-### 10.3 `claimDueScans` query fails
+### 10.3 Consumer group creation fails
+
+`ensureConsumerGroup()` returns an error (non-`BUSYGROUP` Redis error) → `Start()` returns → `main()` exits with code 1.
+
+### 10.4 `claimDueScans` query fails
 
 `runOnce()` logs `ERROR "scheduler iteration failed"` and returns. The next poll ticker tick will retry. No scan rows are modified.
 
-### 10.4 `ensureRunRow` fails (Postgres write error)
+### 10.5 `ensureRunRow` fails (Postgres write error)
 
 `processClaimedScan()` returns an error. The scan row remains in `claiming` status. The recovery loop will reset it to `scheduled` after `SCHEDULER_CLAIM_LEASE` expires.
-
-### 10.5 Redis `SETNX` fails (Redis write error)
-
-`processClaimedScan()` returns an error. The scan row stays in `claiming`. Recovery resets it.
 
 ### 10.6 `NextRunAtForFrequency` returns unsupported frequency
 
@@ -334,7 +342,7 @@ Returns an error before Redis XADD. The scan stays in `claiming`. Recovery reset
 
 ### 10.7 Redis `XADD` fails
 
-The dedupe key is **deleted** to allow future retries. `processClaimedScan()` returns an error. The scan stays in `claiming`. Recovery resets it.
+`processClaimedScan()` returns an error. The `recurring_scan_runs` row remains in `created` status. The scan stays in `claiming`. Recovery resets it to `scheduled`. On the next poll the run row conflict is hit, `ensureRunRow` returns `status='created'` again, and the XADD is retried.
 
 ### 10.8 `markRunEnqueued` finds 0 rows updated
 
@@ -346,11 +354,13 @@ Returns `"advance recurring scan schedule: scan <id> not found"`. This would ind
 
 ### 10.10 Back-pressure triggered
 
-When `len(scan_jobs:urgent) + len(scan_jobs:normal) >= SCHEDULER_MAX_QUEUE_DEPTH`:
+When the consumer group's combined backlog (pending + lag) across both streams reaches `SCHEDULER_MAX_QUEUE_DEPTH`:
 
 - The scheduler logs `WARN "scheduler backpressure active"`.
 - No scans are claimed this iteration.
 - All currently-claimed rows in `claiming` remain as-is until the recovery loop fires.
+
+**Note:** The backlog is measured via `XINFO GROUPS` — it reflects messages that have not yet been **acknowledged by the consumer group**, not simply the total length of the stream. This is a more accurate measure of downstream queue pressure than raw `XLEN`.
 
 **Impact:** scans may run slightly late during sustained back-pressure periods. This is intentional — it prevents the worker from producing more work than downstream can consume.
 
@@ -358,13 +368,13 @@ When `len(scan_jobs:urgent) + len(scan_jobs:normal) >= SCHEDULER_MAX_QUEUE_DEPTH
 
 Replicas are safe to run in parallel because:
 - `FOR UPDATE SKIP LOCKED` prevents two workers from claiming the same row.
-- The Redis dedupe guard prevents duplicate enqueues even if two workers somehow claim the same row in an edge case.
+- The `ensureRunRow` Postgres upsert (keyed on `redis_job_key`) prevents duplicate enqueues even if two workers somehow process the same claim — the second worker will see `status != 'created'` and skip the XADD.
 
 ### 10.12 Worker crashes mid-process (after claim, before `advanceSchedule`)
 
-The claim lease expires and the recovery loop resets `status = 'scheduled'`. If the `recurring_scan_runs` row and/or dedupe key were already written:
-- The run row remains in `created` or `enqueued` status (the `airflow-worker` may still process it if the message landed in Redis).
-- The dedupe key prevents a duplicate enqueue when the recovery loop fires.
+The claim lease expires and the recovery loop resets `status = 'scheduled'`. If the `recurring_scan_runs` row was already written:
+- If status is `created`: the next time this scan is claimed, `ensureRunRow` returns `status='created'`, and the XADD will be retried.
+- If status is `enqueued` or later: `ensureRunRow` returns that status, the XADD is skipped, and the schedule advances.
 
 ### 10.13 Graceful shutdown signal (SIGINT / SIGTERM)
 

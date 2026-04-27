@@ -15,8 +15,9 @@ It consumes job messages from Redis Streams, triggers Apache Airflow DAG runs, p
 6. [Main Processing Flow](#6-main-processing-flow)
 7. [Airflow API Integration](#7-airflow-api-integration)
 8. [Retry & Max-Attempts Logic](#8-retry--max-attempts-logic)
-9. [Acknowledgement (`XACK`)](#9-acknowledgement-xack)
-10. [Error Scenarios](#10-error-scenarios)
+9. [Acknowledgement & Deletion (`ackAndDelete`)](#9-acknowledgement--deletion-ackanddelete)
+10. [PEL Recovery Loop](#10-pel-recovery-loop)
+11. [Error Scenarios](#11-error-scenarios)
 
 ---
 
@@ -30,19 +31,20 @@ It consumes job messages from Redis Streams, triggers Apache Airflow DAG runs, p
 │  │  Controller goroutine (Start)                               │    │
 │  │    ├─ ensureConsumerGroup (scan_jobs:urgent)                │    │
 │  │    ├─ ensureConsumerGroup (scan_jobs:normal)                │    │
-│  │    └─ spawn N × localWorkerLoop goroutines                  │    │
+│  │    ├─ spawn N × localWorkerLoop goroutines                  │    │
+│  │    └─ spawn 1 × recoveryLoop goroutine                      │    │
 │  └─────────────────────────────────────────────────────────────┘    │
 │                                                                      │
-│  ┌─────────────┐  ┌─────────────┐        ┌─────────────┐           │
-│  │  worker #1  │  │  worker #2  │  ···   │  worker #N  │           │
-│  │  loop       │  │  loop       │        │  loop       │           │
-│  └──────┬──────┘  └──────┬──────┘        └──────┬──────┘           │
-└─────────┼────────────────┼────────────────────── ┼──────────────────┘
-          │                │                        │
-    ┌─────▼────────────────▼────────────────────────▼─────┐
-    │               Redis Streams                          │
-    │   scan_jobs:urgent     scan_jobs:normal              │
-    └──────────────────────────────────────────────────────┘
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────┐  │
+│  │  worker #1  │  │  worker #2  │  │  worker #N  │  │ recovery │  │
+│  │  loop       │  │  loop       │  │  loop       │  │ loop     │  │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └────┬─────┘  │
+└─────────┼────────────────┼────────────────┼───────────────┼─────────┘
+          │                │                │               │ XAUTOCLAIM
+    ┌─────▼────────────────▼────────────────▼───────────────▼─────┐
+    │               Redis Streams                                  │
+    │   scan_jobs:urgent     scan_jobs:normal                      │
+    └──────────────────────────────────────────────────────────────┘
           │
     ┌─────▼───────────────┐     ┌──────────────────────────┐
     │  Apache Airflow API │     │  Postgres (scanning DB)  │
@@ -108,11 +110,17 @@ The consumer group is created with `XGROUP CREATE … MKSTREAM 0` on startup. Th
 | `AIRFLOW_PASSWORD` | `admin` | Basic auth password for the Airflow REST API |
 | `AIRFLOW_POLL_INTERVAL` | `3s` | How often to poll `GET /dagRuns/{id}` while waiting |
 | `AIRFLOW_RUN_TIMEOUT` | `5m` | Deadline for a single DAG run to reach a terminal state |
+| `REDIS_PEL_RECOVERY_INTERVAL` | `30s` | How often the recovery loop runs `XAUTOCLAIM` on both streams |
+| `REDIS_PEL_MIN_IDLE` | `5m` | Minimum time a PEL entry must be idle before it is claimed by the recovery loop |
+| `REDIS_PEL_RECOVERY_COUNT` | `100` | Max messages to reclaim per `XAUTOCLAIM` call per stream |
 
 **Validation errors** at startup (process exits):
 - `WORKERS_PER_CONTROLLER` ≤ 0
 - `REDIS_READ_COUNT` ≤ 0
 - `REDIS_URGENT_BURST` ≤ 0
+- `REDIS_PEL_RECOVERY_INTERVAL` ≤ 0
+- `REDIS_PEL_MIN_IDLE` ≤ 0
+- `REDIS_PEL_RECOVERY_COUNT` ≤ 0
 
 ---
 
@@ -128,6 +136,7 @@ main()
   │     ├─ ensureConsumerGroup(scan_jobs:urgent)
   │     ├─ ensureConsumerGroup(scan_jobs:normal)
   │     ├─ spawn WORKERS_PER_CONTROLLER goroutines → localWorkerLoop(ctx, id)
+  │     ├─ spawn 1 goroutine       → recoveryLoop(ctx)
   │     └─ <-ctx.Done()            block until shutdown
   │           workerGroup.Wait()   wait for all goroutines to exit
   └─ on signal / Start() error:
@@ -171,7 +180,7 @@ This means: for every burst of `UrgentBurst` (default 20) urgent messages, at le
 processMessage(event)
   │
   ├─ 1. Extract scan_run_id from message values
-  │       If blank → XACK and return  (malformed message, discard)
+  │       If blank → ackAndDelete (XACK + XDEL) and return  (malformed message, discard)
   │
   ├─ 2. markRunRunning()
   │       UPDATE recurring_scan_runs
@@ -181,14 +190,15 @@ processMessage(event)
   │
   ├─ 3. If attempt_count > max_attempts:
   │       markMaxAttemptsExceeded() → status='max_attempts_exceeded'
-  │       XACK message
+  │       ackAndDelete (XACK + XDEL)
   │       return   ← terminal, no more retries
   │
   ├─ 4. Build Airflow payload (see §7)
   │
   ├─ 5. triggerDAG()
   │       POST /api/v1/dags/{dag_id}/dagRuns
-  │       On error → handleExecutionFailure(reason="trigger_failed")
+  │       HTTP 409 Conflict → treated as idempotent success (log WARN, reuse dag_run_id)
+  │       Other error → handleExecutionFailure(reason="trigger_failed")
   │
   ├─ 6. attachDagRunID()
   │       UPDATE recurring_scan_runs SET airflow_dag_id, airflow_dag_run_id
@@ -209,7 +219,7 @@ processMessage(event)
   ├─ 10. markSucceeded()
   │        UPDATE status='succeeded', result=$jsonb, finished_at=now()
   │
-  └─ 11. XACK message
+  └─ 11. ackAndDelete (XACK + XDEL)
 ```
 
 ### `handleExecutionFailure(event, scanRunID, attempt, maxAttempts, reason, err)`
@@ -217,14 +227,14 @@ processMessage(event)
 ```
 If attempt >= maxAttempts:
   markMaxAttemptsExceeded(reason, details)  → status='max_attempts_exceeded'
-  XACK message
+  ackAndDelete (XACK + XDEL)
   return
 
 Else (retryable):
   requeueForRetry()
     UPDATE status='enqueued', failure_reason, failure_details
     XAdd to same stream (re-enqueue with same payload fields)
-  XACK original message
+  ackAndDelete original message (XACK + XDEL)
   return
 ```
 
@@ -236,14 +246,16 @@ Else (retryable):
 
 **DAG Run ID format:**
 ```
-scan_<scanRunIDWithoutDashes>_attempt_<attemptCount>_<unixTimestamp>
+scan_<scanRunIDWithoutDashes>_attempt_<attemptCount>
 ```
-Example: `scan_abc123def456_attempt_1_1714000000`
+Example: `scan_abc123def456_attempt_1`
+
+The ID is deterministic for a given `(scan_run_id, attempt)` pair. This means if the worker crashes after triggering but before writing the DAG run ID to Postgres, a retry will generate the **same** DAG run ID. Airflow will return HTTP 409 Conflict for that request, which the worker treats as an idempotent success — it logs a WARN and reuses the existing `dag_run_id` without counting it as a failure.
 
 **Request body:**
 ```json
 {
-  "dag_run_id": "scan_abc123..._attempt_1_1714000000",
+  "dag_run_id": "scan_abc123..._attempt_1",
   "conf": {
     "scan_run_id": "<uuid>",
     "redis_message_id": "<stream-message-id>",
@@ -258,7 +270,7 @@ Example: `scan_abc123def456_attempt_1_1714000000`
 Authentication: HTTP Basic Auth (`AIRFLOW_USERNAME` / `AIRFLOW_PASSWORD`).  
 Timeout: 30 seconds (shared `http.Client` timeout).
 
-A non-2xx response returns the raw response body in the error message.
+HTTP 409 Conflict is treated as a successful idempotent trigger. Any other non-2xx response returns the raw response body in the error message.
 
 ### Poll DAG State (`GET /api/v1/dags/{dag_id}/dagRuns/{dag_run_id}`)
 
@@ -318,64 +330,105 @@ When re-enqueuing for retry, the **same stream** as the original message is used
 
 ---
 
-## 9. Acknowledgement (`XACK`)
+## 9. Acknowledgement & Deletion (`ackAndDelete`)
 
-`XACK` is called via `w.ack(ctx, stream, messageID)` only in the following terminal cases:
+`ackAndDelete(stream, messageID)` calls **both** `XACK` and `XDEL` on the message. This ensures the message is removed from both the consumer group's Pending Entry List (PEL) and from the stream itself, keeping stream memory usage bounded.
 
-| Outcome | XACK called? |
+`ackAndDelete` is called in the following terminal cases:
+
+| Outcome | ackAndDelete called? |
 |---|---|
 | Message has blank `scan_run_id` (malformed) | ✅ Yes |
 | `attempt_count > max_attempts` before trigger | ✅ Yes |
 | DAG succeeded, result stored | ✅ Yes |
 | Any failure at `attempt >= max_attempts` | ✅ Yes |
-| Any failure at `attempt < max_attempts` (retried via re-enqueue) | ✅ Yes (original message ACKed, new message re-added) |
-| `markRunRunning` fails (Postgres error) | ❌ No — message remains in PEL for manual recovery or consumer restart |
+| Any failure at `attempt < max_attempts` (retried via re-enqueue) | ✅ Yes (original ACKed+deleted, new message added) |
+| `markRunRunning` fails (Postgres error) | ❌ No — message stays in PEL, eligible for recovery |
 | `attachDagRunID` fails | ❌ No |
 | `markSucceeded` fails | ❌ No |
 | `requeueForRetry` XAdd fails | ❌ No |
 
-**Important:** Un-ACKed messages remain in the consumer's Pending Entry List (PEL). They are not re-delivered automatically to the same consumer — a separate PEL recovery mechanism (e.g. `XAUTOCLAIM` or a watchdog) would be needed if the consumer crashes after triggering but before ACKing.
+Un-ACKed messages that stay in the PEL are automatically reclaimed by the `recoveryLoop` goroutine once they have been idle for `REDIS_PEL_MIN_IDLE` (default 5 minutes).
 
 ---
 
-## 10. Error Scenarios
+## 10. PEL Recovery Loop
 
-### 10.1 Postgres unreachable at startup
+The `recoveryLoop` goroutine runs alongside the worker goroutines and is responsible for reclaiming messages that became stranded in the Pending Entry List (e.g. when a consumer crashes between triggering a DAG and calling `ackAndDelete`).
+
+```
+recoveryLoop(ctx)
+  │
+  └─ ticker fires every PELRecoveryInterval (default 30 s)
+       ├─ recoverStalePendingMessages(ctx, scan_jobs:urgent)
+       └─ recoverStalePendingMessages(ctx, scan_jobs:normal)
+```
+
+### `recoverStalePendingMessages(ctx, stream)`
+
+```
+start = "0-0"
+loop:
+  XAUTOCLAIM stream ConsumerGroup ConsumerName
+    MinIdle=PELMinIdle, Start=start, Count=PELRecoveryCount
+  → messages (claimed from other/dead consumers), nextStart
+
+  if len(messages) == 0 → return
+
+  log WARN "recovered stale pending stream messages" (count, stream, min_idle)
+
+  for each message:
+    processMessage(ctx, {Stream: stream, Msg: message})
+    errors logged individually, loop continues
+
+  if nextStart == start or nextStart == "0-0" → return
+  start = nextStart   ← paginate through the PEL
+```
+
+`XAUTOCLAIM` atomically re-assigns idle PEL entries from their current owner to `ConsumerName`. Each recovered message is then passed through the normal `processMessage` path, including the attempt counter check, DAG trigger, and `ackAndDelete`. Because the DAG run ID is deterministic (`scan_<id>_attempt_<n>`), a re-triggered run will receive HTTP 409 and the existing DAG run will be reused rather than a duplicate being created.
+
+---
+
+## 11. Error Scenarios
+
+### 11.1 Postgres unreachable at startup
 
 `ping()` returns an error → `Start()` returns → `main()` exits with code 1.
 
-### 10.2 Redis unreachable at startup
+### 11.2 Redis unreachable at startup
 
 Same as above.
 
-### 10.3 Consumer group creation fails
+### 11.3 Consumer group creation fails
 
 `ensureConsumerGroup()` returns an error (non-`BUSYGROUP` Redis error) → `Start()` returns → `main()` exits with code 1.
 
-### 10.4 Redis read error inside `localWorkerLoop`
+### 11.4 Redis read error inside `localWorkerLoop`
 
 Error is logged as `ERROR "failed reading redis stream"`. The goroutine sleeps 1 second and retries. If the error is `context.Canceled` (shutdown), the goroutine exits cleanly.
 
-### 10.5 Malformed message (missing `scan_run_id`)
+### 11.5 Malformed message (missing `scan_run_id`)
 
-The message is immediately XACK'd and discarded. No Postgres update is made.
+The message is immediately `ackAndDelete`'d (XACK + XDEL) and discarded. No Postgres update is made.
 
-### 10.6 `markRunRunning` fails (Postgres error)
+### 11.6 `markRunRunning` fails (Postgres error)
 
-`processMessage` returns the error. The `localWorkerLoop` logs `ERROR "failed processing message"` and reads the next message. The original Redis message is **not** XACK'd — it stays in the PEL and will not be re-delivered to this consumer automatically.
+`processMessage` returns the error. The `localWorkerLoop` logs `ERROR "failed processing message"`. The original Redis message is **not** ACKed — it stays in the PEL. The `recoveryLoop` will reclaim it after `REDIS_PEL_MIN_IDLE` (default 5 min) and retry processing.
 
-### 10.7 DAG trigger fails (`trigger_failed`)
+### 11.7 DAG trigger fails (`trigger_failed`)
 
 `handleExecutionFailure` is called:
-- If retries remain: re-enqueued to same stream, original XACK'd, run status = `enqueued`.
-- If no retries remain: run marked `max_attempts_exceeded`, XACK'd.
+- If retries remain: re-enqueued to same stream, original `ackAndDelete`'d, run status = `enqueued`.
+- If no retries remain: run marked `max_attempts_exceeded`, `ackAndDelete`'d.
 
 Common causes:
 - Airflow webserver not yet healthy (startup race).
 - Network error between worker and Airflow.
-- Airflow returns 4xx/5xx (e.g. DAG not found, DAG paused, duplicate `dag_run_id`).
+- Airflow returns non-409 4xx/5xx (e.g. DAG not found, DAG paused).
 
-### 10.8 DAG monitoring timeout (`monitor_failed`)
+Note: HTTP 409 Conflict is **not** treated as a failure — it is handled as an idempotent success.
+
+### 11.8 DAG monitoring timeout (`monitor_failed`)
 
 `waitForDAGCompletion` exceeds `AIRFLOW_RUN_TIMEOUT`. Same retry/terminal logic as trigger failure.
 
@@ -384,30 +437,34 @@ Common causes:
 - The DAG task hangs or deadlocks.
 - Airflow API is temporarily unreachable during polling.
 
-### 10.9 DAG run reports `failed` state (`dag_failed`)
+### 11.9 DAG run reports `failed` state (`dag_failed`)
 
 Same retry/terminal logic. The DAG's own internal error is not surfaced beyond the `dag_failed` label in Postgres.
 
-### 10.10 XCom fetch fails
+### 11.10 XCom fetch fails
 
 The worker logs `WARN "failed fetching airflow xcom result; using fallback static payload"`. The run is still marked `succeeded` with the static fallback payload. This is a non-fatal degradation.
 
-### 10.11 `markSucceeded` fails (Postgres error)
+### 11.11 `markSucceeded` fails (Postgres error)
 
-`processMessage` returns the error. XACK is **not** called. The next attempt by the same consumer will re-process the message (incrementing `attempt_count`), potentially triggering another DAG run.
+`processMessage` returns the error. `ackAndDelete` is **not** called. The message stays in the PEL and will be reclaimed by the `recoveryLoop`. The next attempt will increment `attempt_count` and potentially trigger another DAG run (with the same deterministic `dag_run_id`; Airflow 409 will be handled gracefully).
 
-### 10.12 `requeueForRetry` XAdd to Redis fails
+### 11.12 `requeueForRetry` XAdd to Redis fails
 
-`processMessage` returns the error. XACK is not called. The original message remains in the PEL.
+`processMessage` returns the error. `ackAndDelete` is not called. The original message remains in the PEL and will be reclaimed by the `recoveryLoop`.
 
-### 10.13 Multiple `airflow-worker` replicas
+### 11.13 Multiple `airflow-worker` replicas
 
-Safe to run in parallel. Each replica has its own `REDIS_CONSUMER_NAME` (hostname by default) within the shared consumer group. Redis Streams consumer group semantics ensure each message is delivered to exactly one consumer at a time. The `attempt_count` in Postgres is incremented atomically, so even if a message is somehow processed by two consumers concurrently (e.g. after a PEL takeover), the attempt counter guards against unbounded retries.
+Safe to run in parallel. Each replica has its own `REDIS_CONSUMER_NAME` (hostname by default) within the shared consumer group. Redis Streams consumer group semantics ensure each message is delivered to exactly one consumer at a time. The `attempt_count` in Postgres is incremented atomically, so even if a message is somehow processed by two consumers concurrently (e.g. during a PEL takeover race), the attempt counter guards against unbounded retries.
 
-### 10.14 Worker crashes after DAG trigger but before XACK
+### 11.14 Worker crashes after DAG trigger but before `ackAndDelete`
 
-The message stays in the PEL indefinitely. A `XAUTOCLAIM`-based recovery mechanism (not currently implemented) would be needed to re-deliver it. Without that, the `recurring_scan_run` row will remain in `running` status.
+The message stays in the PEL. After `REDIS_PEL_MIN_IDLE` (default 5 minutes), the `recoveryLoop` calls `XAUTOCLAIM` and reclaims the message. The deterministic DAG run ID means the re-trigger will hit Airflow 409 Conflict, which is handled as an idempotent success. The DAG result is fetched, and the run is marked `succeeded`.
 
-### 10.15 Graceful shutdown (SIGINT / SIGTERM)
+### 11.15 `recoveryLoop` — `XAUTOCLAIM` fails
 
-`ctx.Done()` fires. Each `localWorkerLoop` checks `ctx.Done()` at the top of its loop and returns. `workerGroup.Wait()` in `Start()` blocks until all goroutines exit. `Stop()` then closes the Postgres pool and Redis client within a 10-second timeout. In-flight DAG polls are cancelled through the context — the corresponding message is not XACK'd and the run remains in `running` status until the next worker instance picks it up (if PEL recovery is in place) or until a manual fix.
+The error is logged as `ERROR "failed recovering stale urgent/normal pending entries"`. The loop sleeps until the next tick and retries. No messages are modified.
+
+### 11.16 Graceful shutdown (SIGINT / SIGTERM)
+
+`ctx.Done()` fires. Each `localWorkerLoop` and the `recoveryLoop` check `ctx.Done()` at the top of their loops and return. `workerGroup.Wait()` in `Start()` blocks until all goroutines exit. `Stop()` then closes the Postgres pool and Redis client within a 10-second timeout. In-flight DAG polls are cancelled through the context — the corresponding messages are not ACKed and remain in the PEL, where the `recoveryLoop` of the next worker instance will reclaim them.
