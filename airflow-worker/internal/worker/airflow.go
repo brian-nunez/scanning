@@ -23,7 +23,7 @@ type xcomEntryResponse struct {
 }
 
 func (w *Worker) triggerDAG(ctx context.Context, scanRunID string, attempt int, payload map[string]any) (string, error) {
-	dagRunID := fmt.Sprintf("scan_%s_attempt_%d_%d", strings.ReplaceAll(scanRunID, "-", ""), attempt, time.Now().Unix())
+	dagRunID := fmt.Sprintf("scan_%s_attempt_%d", strings.ReplaceAll(scanRunID, "-", ""), attempt)
 
 	requestBody := map[string]any{
 		"dag_run_id": dagRunID,
@@ -49,6 +49,15 @@ func (w *Worker) triggerDAG(ctx context.Context, scanRunID string, attempt int, 
 		return "", fmt.Errorf("execute airflow trigger request: %w", err)
 	}
 	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusConflict {
+		w.logger.Warn("airflow dag run already exists; treating as idempotent trigger",
+			"dag_run_id", dagRunID,
+			"scan_run_id", scanRunID,
+			"attempt", attempt,
+		)
+		return dagRunID, nil
+	}
 
 	if res.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(res.Body, 8*1024))

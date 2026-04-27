@@ -23,6 +23,8 @@ const (
 	defaultAirflowTaskID        = "run_scan"
 	defaultAirflowPollInterval  = 3 * time.Second
 	defaultAirflowRunTimeout    = 5 * time.Minute
+	defaultPELRecoveryInterval  = 30 * time.Second
+	defaultPELRecoveryCount     = 100
 )
 
 type Config struct {
@@ -45,6 +47,9 @@ type Config struct {
 	AirflowPassword      string
 	AirflowPollInterval  time.Duration
 	AirflowRunTimeout    time.Duration
+	PELRecoveryInterval  time.Duration
+	PELMinIdle           time.Duration
+	PELRecoveryCount     int64
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -73,6 +78,9 @@ func LoadConfigFromEnv() (Config, error) {
 		AirflowPassword:      envOrDefault("AIRFLOW_PASSWORD", "admin"),
 		AirflowPollInterval:  durationEnvOrDefault("AIRFLOW_POLL_INTERVAL", defaultAirflowPollInterval),
 		AirflowRunTimeout:    durationEnvOrDefault("AIRFLOW_RUN_TIMEOUT", defaultAirflowRunTimeout),
+		PELRecoveryInterval:  durationEnvOrDefault("REDIS_PEL_RECOVERY_INTERVAL", defaultPELRecoveryInterval),
+		PELMinIdle:           durationEnvOrDefault("REDIS_PEL_MIN_IDLE", defaultAirflowRunTimeout),
+		PELRecoveryCount:     int64(intEnvOrDefault("REDIS_PEL_RECOVERY_COUNT", defaultPELRecoveryCount)),
 	}
 
 	if cfg.WorkersPerController <= 0 {
@@ -83,6 +91,15 @@ func LoadConfigFromEnv() (Config, error) {
 	}
 	if cfg.UrgentBurst <= 0 {
 		return Config{}, fmt.Errorf("REDIS_URGENT_BURST must be > 0")
+	}
+	if cfg.PELRecoveryInterval <= 0 {
+		return Config{}, fmt.Errorf("REDIS_PEL_RECOVERY_INTERVAL must be > 0")
+	}
+	if cfg.PELMinIdle <= 0 {
+		return Config{}, fmt.Errorf("REDIS_PEL_MIN_IDLE must be > 0")
+	}
+	if cfg.PELRecoveryCount <= 0 {
+		return Config{}, fmt.Errorf("REDIS_PEL_RECOVERY_COUNT must be > 0")
 	}
 
 	return cfg, nil

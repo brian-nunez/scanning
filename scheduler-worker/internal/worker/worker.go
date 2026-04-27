@@ -59,6 +59,12 @@ func (w *Worker) Start(ctx context.Context) error {
 	if err := w.ping(ctx); err != nil {
 		return err
 	}
+	if err := w.ensureConsumerGroup(ctx, w.cfg.StreamUrgent); err != nil {
+		return err
+	}
+	if err := w.ensureConsumerGroup(ctx, w.cfg.StreamNormal); err != nil {
+		return err
+	}
 
 	pollTicker := time.NewTicker(w.cfg.PollInterval)
 	defer pollTicker.Stop()
@@ -121,14 +127,14 @@ func (w *Worker) ping(ctx context.Context) error {
 }
 
 func (w *Worker) runOnce(ctx context.Context) error {
-	depth, err := w.queueDepth(ctx)
+	backlog, err := w.queueBacklog(ctx)
 	if err != nil {
 		return err
 	}
 
-	if depth >= w.cfg.MaxQueueDepth {
+	if backlog >= w.cfg.MaxQueueDepth {
 		w.logger.Warn("scheduler backpressure active",
-			"queue_depth", depth,
+			"queue_backlog", backlog,
 			"max_queue_depth", w.cfg.MaxQueueDepth,
 		)
 		return nil
@@ -153,18 +159,44 @@ func (w *Worker) runOnce(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) queueDepth(ctx context.Context) (int64, error) {
-	normalDepth, err := w.redis.XLen(ctx, w.cfg.StreamNormal).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return 0, fmt.Errorf("get normal stream depth: %w", err)
+func (w *Worker) queueBacklog(ctx context.Context) (int64, error) {
+	urgentBacklog, err := w.groupBacklogForStream(ctx, w.cfg.StreamUrgent)
+	if err != nil {
+		return 0, fmt.Errorf("get urgent stream backlog: %w", err)
 	}
 
-	urgentDepth, err := w.redis.XLen(ctx, w.cfg.StreamUrgent).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return 0, fmt.Errorf("get urgent stream depth: %w", err)
+	normalBacklog, err := w.groupBacklogForStream(ctx, w.cfg.StreamNormal)
+	if err != nil {
+		return 0, fmt.Errorf("get normal stream backlog: %w", err)
 	}
 
-	return normalDepth + urgentDepth, nil
+	return urgentBacklog + normalBacklog, nil
+}
+
+func (w *Worker) groupBacklogForStream(ctx context.Context, stream string) (int64, error) {
+	groups, err := w.redis.XInfoGroups(ctx, stream).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) || isNoSuchKeyError(err) {
+			return 0, nil
+		}
+
+		return 0, err
+	}
+
+	for _, group := range groups {
+		if group.Name != w.cfg.ConsumerGroup {
+			continue
+		}
+
+		backlog := group.Pending
+		if group.Lag > 0 {
+			backlog += group.Lag
+		}
+
+		return backlog, nil
+	}
+
+	return 0, nil
 }
 
 func (w *Worker) claimDueScans(ctx context.Context) ([]recurringScan, error) {
@@ -226,15 +258,9 @@ func (w *Worker) processClaimedScan(ctx context.Context, scan recurringScan) err
 	scheduledFor := scan.NextRunAt.UTC()
 	redisJobKey := fmt.Sprintf("scan:%s:%d", scan.ID, scheduledFor.Unix())
 
-	runID, err := w.ensureRunRow(ctx, scan, scheduledFor, redisJobKey)
+	runID, runStatus, err := w.ensureRunRow(ctx, scan, scheduledFor, redisJobKey)
 	if err != nil {
 		return err
-	}
-
-	dedupeKey := fmt.Sprintf("dedupe:%s", redisJobKey)
-	created, err := w.redis.SetNX(ctx, dedupeKey, "1", w.cfg.RedisDedupeTTL).Result()
-	if err != nil {
-		return fmt.Errorf("set redis dedupe key: %w", err)
 	}
 
 	nextRunAt, spreadOffset, err := NextRunAtForFrequency(scan.AssetID, scan.Frequency, time.Now().UTC())
@@ -242,14 +268,16 @@ func (w *Worker) processClaimedScan(ctx context.Context, scan recurringScan) err
 		return fmt.Errorf("calculate next_run_at: %w", err)
 	}
 
-	if !created {
-		w.logger.Info("dedupe key already exists, skipping redis enqueue",
+	if runStatus != "created" {
+		w.logger.Info("scan run already exists in non-created state, skipping enqueue",
 			"scan_id", scan.ID,
+			"scan_run_id", runID,
+			"scan_run_status", runStatus,
 			"redis_job_key", redisJobKey,
 		)
 
 		if err := w.advanceSchedule(ctx, scan.ID, nextRunAt, spreadOffset); err != nil {
-			return fmt.Errorf("advance schedule after dedupe skip: %w", err)
+			return fmt.Errorf("advance schedule after enqueue skip: %w", err)
 		}
 
 		return nil
@@ -272,8 +300,6 @@ func (w *Worker) processClaimedScan(ctx context.Context, scan recurringScan) err
 
 	redisMessageID, err := w.redis.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: payload}).Result()
 	if err != nil {
-		// Roll back dedupe guard on enqueue failure so this run can be retried.
-		_ = w.redis.Del(ctx, dedupeKey).Err()
 		return fmt.Errorf("enqueue redis stream message: %w", err)
 	}
 
@@ -296,7 +322,7 @@ func (w *Worker) processClaimedScan(ctx context.Context, scan recurringScan) err
 	return nil
 }
 
-func (w *Worker) ensureRunRow(ctx context.Context, scan recurringScan, scheduledFor time.Time, redisJobKey string) (string, error) {
+func (w *Worker) ensureRunRow(ctx context.Context, scan recurringScan, scheduledFor time.Time, redisJobKey string) (string, string, error) {
 	runID := uuid.New().String()
 
 	query := `
@@ -316,10 +342,11 @@ INSERT INTO recurring_scan_runs (
 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, 'created', $6, $7, $8, now(), now())
 ON CONFLICT (redis_job_key)
 DO UPDATE SET updated_at = now()
-RETURNING id::text;
+RETURNING id::text, status;
 `
 
 	var existingRunID string
+	var existingStatus string
 	err := w.pg.QueryRow(ctx, query,
 		runID,
 		scan.ID,
@@ -329,12 +356,12 @@ RETURNING id::text;
 		scan.Priority,
 		redisJobKey,
 		w.cfg.MaxAttempts,
-	).Scan(&existingRunID)
+	).Scan(&existingRunID, &existingStatus)
 	if err != nil {
-		return "", fmt.Errorf("insert or fetch scan run row: %w", err)
+		return "", "", fmt.Errorf("insert or fetch scan run row: %w", err)
 	}
 
-	return existingRunID, nil
+	return existingRunID, existingStatus, nil
 }
 
 func (w *Worker) markRunEnqueued(ctx context.Context, runID, stream, redisMessageID string) error {
@@ -405,4 +432,21 @@ WHERE status = 'claiming'
 	}
 
 	return nil
+}
+
+func (w *Worker) ensureConsumerGroup(ctx context.Context, stream string) error {
+	err := w.redis.XGroupCreateMkStream(ctx, stream, w.cfg.ConsumerGroup, "0").Err()
+	if err == nil {
+		return nil
+	}
+
+	if strings.Contains(err.Error(), "BUSYGROUP") {
+		return nil
+	}
+
+	return fmt.Errorf("create consumer group for stream %s: %w", stream, err)
+}
+
+func isNoSuchKeyError(err error) bool {
+	return strings.Contains(err.Error(), "no such key")
 }

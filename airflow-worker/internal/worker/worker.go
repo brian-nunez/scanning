@@ -78,6 +78,8 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.workerGroup.Add(1)
 			go w.localWorkerLoop(ctx, workerID)
 		}
+		w.workerGroup.Add(1)
+		go w.recoveryLoop(ctx)
 		w.started = true
 	}
 	w.startedMutex.Unlock()
@@ -88,6 +90,9 @@ func (w *Worker) Start(ctx context.Context) error {
 		"consumer", w.cfg.ConsumerName,
 		"urgent_stream", w.cfg.StreamUrgent,
 		"normal_stream", w.cfg.StreamNormal,
+		"pel_recovery_interval", w.cfg.PELRecoveryInterval,
+		"pel_min_idle", w.cfg.PELMinIdle,
+		"pel_recovery_count", w.cfg.PELRecoveryCount,
 	)
 
 	<-ctx.Done()
@@ -262,7 +267,7 @@ func (w *Worker) readFromStreams(ctx context.Context, streams []string, block ti
 func (w *Worker) processMessage(ctx context.Context, event streamMessage) error {
 	scanRunID := valueAsString(event.Msg.Values["scan_run_id"])
 	if scanRunID == "" {
-		return w.ack(ctx, event.Stream, event.Msg.ID)
+		return w.ackAndDelete(ctx, event.Stream, event.Msg.ID)
 	}
 
 	attempt, maxAttempts, err := w.markRunRunning(ctx, scanRunID)
@@ -275,7 +280,7 @@ func (w *Worker) processMessage(ctx context.Context, event streamMessage) error 
 			return err
 		}
 
-		return w.ack(ctx, event.Stream, event.Msg.ID)
+		return w.ackAndDelete(ctx, event.Stream, event.Msg.ID)
 	}
 
 	payload := map[string]any{
@@ -320,7 +325,7 @@ func (w *Worker) processMessage(ctx context.Context, event streamMessage) error 
 		return err
 	}
 
-	return w.ack(ctx, event.Stream, event.Msg.ID)
+	return w.ackAndDelete(ctx, event.Stream, event.Msg.ID)
 }
 
 func (w *Worker) handleExecutionFailure(ctx context.Context, event streamMessage, scanRunID string, attempt, maxAttempts int, reason string, err error) error {
@@ -334,14 +339,14 @@ func (w *Worker) handleExecutionFailure(ctx context.Context, event streamMessage
 			return err
 		}
 
-		return w.ack(ctx, event.Stream, event.Msg.ID)
+		return w.ackAndDelete(ctx, event.Stream, event.Msg.ID)
 	}
 
 	if err := w.requeueForRetry(ctx, event, scanRunID, reason, details); err != nil {
 		return err
 	}
 
-	return w.ack(ctx, event.Stream, event.Msg.ID)
+	return w.ackAndDelete(ctx, event.Stream, event.Msg.ID)
 }
 
 func (w *Worker) markRunRunning(ctx context.Context, scanRunID string) (attempt int, maxAttempts int, err error) {
@@ -477,12 +482,79 @@ WHERE id = $1::uuid;
 	return nil
 }
 
-func (w *Worker) ack(ctx context.Context, stream, messageID string) error {
+func (w *Worker) ackAndDelete(ctx context.Context, stream, messageID string) error {
 	if _, err := w.redis.XAck(ctx, stream, w.cfg.ConsumerGroup, messageID).Result(); err != nil {
 		return fmt.Errorf("xack stream message: %w", err)
 	}
+	if _, err := w.redis.XDel(ctx, stream, messageID).Result(); err != nil {
+		return fmt.Errorf("xdel stream message: %w", err)
+	}
 
 	return nil
+}
+
+func (w *Worker) recoveryLoop(ctx context.Context) {
+	defer w.workerGroup.Done()
+
+	ticker := time.NewTicker(w.cfg.PELRecoveryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := w.recoverStalePendingMessages(ctx, w.cfg.StreamUrgent); err != nil {
+				w.logger.Error("failed recovering stale urgent pending entries", "error", err)
+			}
+			if err := w.recoverStalePendingMessages(ctx, w.cfg.StreamNormal); err != nil {
+				w.logger.Error("failed recovering stale normal pending entries", "error", err)
+			}
+		}
+	}
+}
+
+func (w *Worker) recoverStalePendingMessages(ctx context.Context, stream string) error {
+	start := "0-0"
+
+	for {
+		messages, nextStart, err := w.redis.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   stream,
+			Group:    w.cfg.ConsumerGroup,
+			Consumer: w.cfg.ConsumerName,
+			MinIdle:  w.cfg.PELMinIdle,
+			Start:    start,
+			Count:    w.cfg.PELRecoveryCount,
+		}).Result()
+		if err != nil {
+			return fmt.Errorf("xautoclaim stream %s: %w", stream, err)
+		}
+
+		if len(messages) == 0 {
+			return nil
+		}
+
+		w.logger.Warn("recovered stale pending stream messages",
+			"stream", stream,
+			"count", len(messages),
+			"min_idle", w.cfg.PELMinIdle,
+		)
+
+		for _, msg := range messages {
+			if err := w.processMessage(ctx, streamMessage{Stream: stream, Msg: msg}); err != nil {
+				w.logger.Error("failed processing recovered stream message",
+					"stream", stream,
+					"message_id", msg.ID,
+					"error", err,
+				)
+			}
+		}
+
+		if nextStart == start || nextStart == "0-0" {
+			return nil
+		}
+		start = nextStart
+	}
 }
 
 func valueAsString(value any) string {

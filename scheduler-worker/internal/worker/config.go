@@ -11,12 +11,12 @@ const (
 	defaultPostgresDSN           = "postgres://scanning:scanning@postgres:5432/scanning?sslmode=disable"
 	defaultRedisAddr             = "redis:6379"
 	defaultRedisDB               = 0
+	defaultConsumerGroup         = "scan-workers"
 	defaultPollInterval          = 5 * time.Second
 	defaultRecoveryInterval      = 1 * time.Minute
 	defaultClaimLease            = 2 * time.Minute
 	defaultClaimBatchSize        = 100
 	defaultMaxQueueDepth         = int64(5000)
-	defaultRedisDedupeTTL        = 24 * time.Hour
 	defaultStreamNormal          = "scan_jobs:normal"
 	defaultStreamUrgent          = "scan_jobs:urgent"
 	defaultPriorityUrgentMinimum = 50
@@ -27,12 +27,12 @@ type Config struct {
 	RedisAddr               string
 	RedisPassword           string
 	RedisDB                 int
+	ConsumerGroup           string
 	PollInterval            time.Duration
 	RecoveryInterval        time.Duration
 	ClaimLease              time.Duration
 	ClaimBatchSize          int
 	MaxQueueDepth           int64
-	RedisDedupeTTL          time.Duration
 	StreamNormal            string
 	StreamUrgent            string
 	PriorityUrgentThreshold int
@@ -50,10 +50,10 @@ func LoadConfigFromEnv() (Config, error) {
 		PostgresDSN:             envOrDefault("POSTGRES_DSN", defaultPostgresDSN),
 		RedisAddr:               envOrDefault("REDIS_ADDR", defaultRedisAddr),
 		RedisPassword:           envOrDefault("REDIS_PASSWORD", ""),
+		ConsumerGroup:           envOrDefault("REDIS_CONSUMER_GROUP", defaultConsumerGroup),
 		PollInterval:            durationEnvOrDefault("SCHEDULER_POLL_INTERVAL", defaultPollInterval),
 		RecoveryInterval:        durationEnvOrDefault("SCHEDULER_RECOVERY_INTERVAL", defaultRecoveryInterval),
 		ClaimLease:              durationEnvOrDefault("SCHEDULER_CLAIM_LEASE", defaultClaimLease),
-		RedisDedupeTTL:          durationEnvOrDefault("SCHEDULER_REDIS_DEDUPE_TTL", defaultRedisDedupeTTL),
 		StreamNormal:            envOrDefault("REDIS_STREAM_NORMAL", defaultStreamNormal),
 		StreamUrgent:            envOrDefault("REDIS_STREAM_URGENT", defaultStreamUrgent),
 		WorkerID:                envOrDefault("SCHEDULER_WORKER_ID", host),

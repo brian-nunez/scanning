@@ -150,6 +150,7 @@ services:
       REDIS_ADDR: redis:6379
       REDIS_STREAM_NORMAL: scan_jobs:normal
       REDIS_STREAM_URGENT: scan_jobs:urgent
+      REDIS_CONSUMER_GROUP: scan-workers
       PRIORITY_URGENT_THRESHOLD: "50"
       SCHEDULER_CLAIM_BATCH_SIZE: "100"
       SCHEDULER_MAX_QUEUE_DEPTH: "5000"
@@ -175,6 +176,9 @@ services:
       REDIS_CONSUMER_GROUP: scan-workers
       WORKERS_PER_CONTROLLER: "4"
       REDIS_URGENT_BURST: "20"
+      REDIS_PEL_RECOVERY_INTERVAL: 30s
+      REDIS_PEL_MIN_IDLE: 5m
+      REDIS_PEL_RECOVERY_COUNT: "100"
       AIRFLOW_BASE_URL: http://airflow-webserver:8080
       AIRFLOW_DAG_ID: scan_example
       AIRFLOW_TASK_ID: run_scan
